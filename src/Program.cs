@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -230,31 +231,52 @@ namespace YiYi
                 Rectangle abs = new Rectangle(vs.X + rect.X, vs.Y + rect.Y, rect.Width, rect.Height);
                 await Task.Delay(120);
 
-                string ocrText;
-                using (Bitmap bmp = new Bitmap(abs.Width, abs.Height))
+                List<OcrLineInfo> lines;
+                Bitmap shot = new Bitmap(abs.Width, abs.Height);
+                using (Graphics g = Graphics.FromImage(shot))
+                    g.CopyFromScreen(abs.X, abs.Y, 0, 0, abs.Size);
+                try
                 {
-                    using (Graphics g = Graphics.FromImage(bmp))
-                        g.CopyFromScreen(abs.X, abs.Y, 0, 0, abs.Size);
-                    using (Bitmap big = OcrHelper.Upscale(bmp))
+                    using (Bitmap big = OcrHelper.Upscale(shot))
                     {
                         if (Program.Settings.ScreenOcrLang == "auto")
-                            ocrText = await OcrHelper.RecognizeAutoAsync(big);
+                            lines = await OcrHelper.RecognizeAutoLinesAsync(big);
                         else
-                            ocrText = await OcrHelper.RecognizeAsync(big, Program.Settings.ScreenOcrLang);
+                            lines = await OcrHelper.RecognizeLinesAsync(big, Program.Settings.ScreenOcrLang);
                     }
                 }
-                if (string.IsNullOrWhiteSpace(ocrText))
+                catch
                 {
+                    shot.Dispose();
+                    throw;
+                }
+                if (lines == null || lines.Count == 0)
+                {
+                    shot.Dispose();
                     Balloon("屏幕翻译", "没有识别到文字，请框选包含文字的区域。", ToolTipIcon.Warning);
                     return;
                 }
-                ocrText = ocrText.Trim();
-                if (ocrText.Length > 4000) ocrText = ocrText.Substring(0, 4000);
 
-                ResultForm rf = new ResultForm(ocrText, "正在翻译…");
+                // 逐行翻译（保持 OCR 从上到下的顺序）；失败的行保留原文
+                List<string> translated = new List<string>(lines.Count);
+                StringBuilder full = new StringBuilder();
+                foreach (OcrLineInfo li in lines)
+                {
+                    string src = li.Text.Trim();
+                    string tr = src;
+                    if (DocTranslator.IsTranslatableText(src, false))
+                    {
+                        string req = src.Length > 1000 ? src.Substring(0, 1000) : src;
+                        try { tr = (await Program.Client.TranslateAsync(req)).Trim(); }
+                        catch { tr = src; }
+                    }
+                    translated.Add(tr);
+                    if (tr.Length > 0) full.AppendLine(tr);
+                }
+
+                Bitmap annotated = Annotator.Draw(shot, lines, translated);
+                AnnotatedResultForm rf = new AnnotatedResultForm(annotated, full.ToString().TrimEnd());
                 rf.Show();
-                try { rf.SetTranslation(await Program.Client.TranslateAsync(ocrText)); }
-                catch (Exception ex) { rf.SetTranslation("翻译失败：" + ex.Message); }
             }
             finally
             {

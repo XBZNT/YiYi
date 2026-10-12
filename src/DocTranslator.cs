@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -202,8 +204,9 @@ namespace YiYi
                         BitmapDecoder decoder = await BitmapDecoder.CreateAsync(renderStream);
                         using (SoftwareBitmap sbmp = await decoder.GetSoftwareBitmapAsync(
                             BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied))
+                        using (Bitmap renderedBmp = SoftwareBitmapToBitmap(sbmp))
                         {
-                            pageText = await OcrHelper.RecognizeAutoCoreAsync(sbmp);
+                            pageText = await OcrHelper.RecognizeAsync(renderedBmp, "auto") ?? "";
                         }
                     }
                 }
@@ -230,6 +233,34 @@ namespace YiYi
         }
 
         // ---------------- 公共辅助 ----------------
+
+        /// <summary>把 WinRT SoftwareBitmap（Bgra8）复制成 GDI Bitmap。</summary>
+        static Bitmap SoftwareBitmapToBitmap(Windows.Graphics.Imaging.SoftwareBitmap sb)
+        {
+            int w = sb.PixelWidth, h = sb.PixelHeight;
+            byte[] px = new byte[w * h * 4];
+            Windows.Storage.Streams.IBuffer buf = Windows.Security.Cryptography.CryptographicBuffer.CreateFromByteArray(new byte[w * h * 4]);
+            sb.CopyToBuffer(buf);
+            Windows.Security.Cryptography.CryptographicBuffer.CopyToByteArray(buf, out px);
+            Bitmap bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            BitmapData bd = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try
+            {
+                long basePtr = bd.Scan0.ToInt64();
+                int stride = bd.Stride;
+                if (stride == w * 4)
+                {
+                    Marshal.Copy(px, 0, bd.Scan0, px.Length);
+                }
+                else
+                {
+                    for (int y = 0; y < h; y++)
+                        Marshal.Copy(new IntPtr(basePtr + y * stride), px, y * w * 4, w * 4);
+                }
+            }
+            finally { bmp.UnlockBits(bd); }
+            return bmp;
+        }
 
         /// <summary>翻译一行文本；URL 和 `代码` 用占位符保护，翻完还原。</summary>
         public static async Task<string> TranslateProtected(string text, EngineClient client)

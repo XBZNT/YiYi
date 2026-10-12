@@ -34,6 +34,7 @@ namespace YiYi
             catch { }
             Console.WriteLine("== 1/6 OCR 测试 ==");
             TestOcr();
+            TestAnnotator();
             Console.WriteLine("== 2/6 翻译接口测试 ==");
             TestEngines().Wait();
             Console.WriteLine("== 3/6 DOCX 翻译测试 ==");
@@ -75,6 +76,21 @@ namespace YiYi
                         string low = (t ?? "").ToLowerInvariant();
                         if (low.Contains("quick") && low.Contains("fox")) Pass("ocr-en");
                         else Fail("ocr-en", "未识别出 quick/fox");
+
+                        // 行级识别 + 归一化坐标检查
+                        List<OcrLineInfo> lines = OcrHelper.RecognizeLinesAsync(big, "en-US").Result;
+                        bool linesOk = lines != null && lines.Count >= 1;
+                        bool rectsOk = true;
+                        foreach (OcrLineInfo li in lines)
+                        {
+                            if (string.IsNullOrWhiteSpace(li.Text)) { linesOk = false; break; }
+                            if (li.Rect.X < -0.01f || li.Rect.Y < 0f
+                                || li.Rect.Right > 1.02f || li.Rect.Bottom > 1f + 1e-4f) { rectsOk = false; break; }
+                        }
+                        Console.WriteLine("行数: " + lines.Count + "，首行: " + (lines.Count > 0 ? lines[0].Text : "(无)")
+                            + " rect=(" + (lines.Count > 0 ? lines[0].Rect.ToString() : "-") + ")");
+                        if (lines.Count >= 1 && lines[0].Text.ToLowerInvariant().Contains("quick") && rectsOk) Pass("ocr-lines");
+                        else Fail("ocr-lines", "行数=" + lines.Count + " rectsOk=" + rectsOk);
                     }
                 }
                 if (langs.Any(delegate(string t) { return t.StartsWith("zh", StringComparison.OrdinalIgnoreCase); }))
@@ -106,6 +122,56 @@ namespace YiYi
                 }
             }
             catch (Exception ex) { Fail("ocr", ex.Message); }
+        }
+
+        static void TestAnnotator()
+        {
+            try
+            {
+                using (Bitmap bmp = new Bitmap(600, 160))
+                {
+                    using (Graphics g = Graphics.FromImage(bmp))
+                    {
+                        g.Clear(Color.White);
+                        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                        using (Font f = new Font("Arial", 26f))
+                        {
+                            g.DrawString("Hello world", f, Brushes.Black, 30, 30);
+                            g.DrawString("Second line here", f, Brushes.Black, 16, 95);
+                        }
+                    }
+                    List<OcrLineInfo> lines = new List<OcrLineInfo>();
+                    try { lines = OcrHelper.RecognizeLinesAsync(bmp, "en-US").Result; } catch { }
+                    if (lines == null || lines.Count == 0) { Fail("annotate", "行级 OCR 无结果"); return; }
+
+                    List<string> trs = new List<string>();
+                    for (int i = 0; i < lines.Count; i++) trs.Add("测试" + (i + 1));
+
+                    using (Bitmap before = (Bitmap)bmp.Clone())
+                    using (Bitmap annotated = Annotator.Draw(bmp, lines, trs))
+                    {
+                        if (annotated.Width != bmp.Width || annotated.Height != bmp.Height)
+                        {
+                            Fail("annotate", "尺寸不一致"); return;
+                        }
+                        int diff = CountDifferentPixels(before, annotated);
+                        Console.WriteLine("差异像素(采样): " + diff + "，行数: " + lines.Count);
+                        if (diff > 0) Pass("annotate");
+                        else Fail("annotate", "标注图与原图相同");
+                    }
+                }
+            }
+            catch (Exception ex) { Fail("annotate", ex.Message); }
+        }
+
+        static int CountDifferentPixels(Bitmap a, Bitmap b)
+        {
+            int w = Math.Min(a.Width, b.Width), h = Math.Min(a.Height, b.Height);
+            int diff = 0;
+            for (int y = 0; y < h; y += 3)
+                for (int x = 0; x < w; x += 3)
+                    if (a.GetPixel(x, y) != b.GetPixel(x, y)) diff++;
+            return diff;
         }
 
         static async Task TestEngines()

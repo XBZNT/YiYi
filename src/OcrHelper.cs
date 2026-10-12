@@ -13,6 +13,13 @@ using Windows.Security.Cryptography;
 
 namespace YiYi
 {
+    /// <summary>一行识别结果；Rect 为归一化坐标（0~1，相对图片宽高），方便贴回任意尺寸的原图。</summary>
+    public class OcrLineInfo
+    {
+        public string Text;
+        public RectangleF Rect;
+    }
+
     /// <summary>
     /// 调用 Windows 10 自带 OCR（离线，不联网），把图片变成文字。
     /// 像素通过 CryptographicBuffer → SoftwareBitmap 直接进入 WinRT，全程不经过文件，
@@ -98,56 +105,102 @@ namespace YiYi
         {
             using (SoftwareBitmap sb = ToSoftwareBitmap(bmp))
             {
-                return await RecognizeCoreAsync(sb, langTag);
+                OcrResult result = await RecognizeCoreAsync(sb, langTag);
+                return result == null || result.Text == null ? "" : result.Text;
             }
         }
 
-        static async Task<string> RecognizeCoreAsync(SoftwareBitmap sb, string langTag)
+        static async Task<OcrResult> RecognizeCoreAsync(SoftwareBitmap sb, string langTag)
         {
             OcrEngine engine = TryCreate(langTag) ?? CreateAuto();
             if (engine == null)
                 throw new Exception("系统没有可用的 OCR 语言包：请在 Windows 设置 → 时间和语言 → 语言 中添加中文或英文语言后重试。");
-            OcrResult result = await engine.RecognizeAsync(sb);
-            return result == null || result.Text == null ? "" : result.Text;
+            return await engine.RecognizeAsync(sb);
         }
 
-        /// <summary>自动模式：用中/英（及系统可用语言）各识别一次，按识别质量挑最好的。</summary>
-        public static async Task<string> RecognizeAutoAsync(Bitmap bmp)
+        /// <summary>行级识别：返回每行文本 + 归一化行框（0~1，相对图片宽高）。</summary>
+        public static async Task<List<OcrLineInfo>> RecognizeLinesAsync(Bitmap bmp, string langTag)
         {
             using (SoftwareBitmap sb = ToSoftwareBitmap(bmp))
             {
-                return await RecognizeAutoCoreAsync(sb);
+                OcrResult result = await RecognizeCoreAsync(sb, langTag);
+                return ToLineInfosUnchecked(result, bmp.Width, bmp.Height);
             }
         }
 
-        public static async Task<string> RecognizeAutoCoreAsync(SoftwareBitmap sb)
+        /// <summary>自动模式（中/英各识别一次取质量最优）的行级识别。</summary>
+        public static async Task<List<OcrLineInfo>> RecognizeAutoLinesAsync(Bitmap bmp)
         {
-            List<string> tags = AvailableLanguages();
-            List<string> picks = new List<string>();
-            foreach (string t in tags)
+            using (SoftwareBitmap sb = ToSoftwareBitmap(bmp))
             {
-                if (StartsWith(t, "en")) picks.Add(t);
-            }
-            foreach (string t in tags)
-            {
-                if (StartsWith(t, "zh") && !picks.Contains(t)) picks.Add(t);
-            }
-            if (picks.Count == 0)
-                foreach (string t in tags) { picks.Add(t); if (picks.Count >= 2) break; }
-            if (picks.Count == 0)
-                throw new Exception("系统没有可用的 OCR 语言包：请在 Windows 设置 → 时间和语言 → 语言 中添加中文或英文语言后重试。");
+                List<string> tags = AvailableLanguages();
+                List<string> picks = new List<string>();
+                foreach (string t in tags) if (StartsWith(t, "en")) picks.Add(t);
+                foreach (string t in tags)
+                    if (StartsWith(t, "zh") && !picks.Contains(t)) picks.Add(t);
+                if (picks.Count == 0)
+                    foreach (string t in tags) { picks.Add(t); if (picks.Count >= 2) break; }
+                if (picks.Count == 0)
+                    throw new Exception("系统没有可用的 OCR 语言包：请在 Windows 设置 → 时间和语言 → 语言 中添加中文或英文语言后重试。");
 
-            string best = null;
-            int bestScore = -1;
-            foreach (string tag in picks)
-            {
-                string text = null;
-                try { text = await RecognizeCoreAsync(sb, tag); } catch { }
-                if (text == null) continue;
-                int score = CountLatinWords(text) * 3 + CountCjk(text);
-                if (score > bestScore) { bestScore = score; best = text; }
+                List<OcrLineInfo> best = null;
+                int bestScore = -1;
+                foreach (string tag in picks)
+                {
+                    List<OcrLineInfo> lines = null;
+                    try
+                    {
+                        OcrResult r = await RecognizeCoreAsync(sb, tag);
+                        lines = ToLineInfosUnchecked(r, sb.PixelWidth, sb.PixelHeight);
+                    }
+                    catch { }
+                    if (lines == null) continue;
+                    int score = 0;
+                    foreach (OcrLineInfo li in lines) score += CountLatinWords(li.Text) * 3 + CountCjk(li.Text);
+                    if (score > bestScore) { bestScore = score; best = lines; }
+                }
+                return best ?? new List<OcrLineInfo>();
             }
-            return best ?? "";
+        }
+
+        /// <summary>把 OcrResult 的行框转成归一化行框（框 = 行内所有词框的并集）。</summary>
+        static List<OcrLineInfo> ToLineInfosUnchecked(OcrResult result, int imgW, int imgH)
+        {
+            List<OcrLineInfo> list = new List<OcrLineInfo>();
+            if (result == null || result.Lines == null) return list;
+            float fw = imgW <= 0 ? 1f : 1f / imgW;
+            float fh = imgH <= 0 ? 1f : 1f / imgH;
+            foreach (OcrLine line in result.Lines)
+            {
+                if (line == null) continue;
+                string text = (line.Text ?? "").Trim();
+                if (text.Length == 0) continue;
+                float minL = float.MaxValue, minT = float.MaxValue, maxR = float.MinValue, maxB = float.MinValue;
+                bool any = false;
+                if (line.Words != null)
+                {
+                    foreach (OcrWord w in line.Words)
+                    {
+                        // 注意：不要写 Windows.Foundation.Rect（会解析到未被引用的投影类型），
+                        // 用 var 让编译器取 winmd 里的实际类型
+                        var r = w.BoundingRect;
+                        minL = Math.Min(minL, (float)r.X);
+                        minT = Math.Min(minT, (float)r.Y);
+                        maxR = Math.Max(maxR, (float)(r.X + r.Width));
+                        maxB = Math.Max(maxB, (float)(r.Y + r.Height));
+                        any = true;
+                    }
+                }
+                if (!any) continue;
+                RectangleF rf = new RectangleF(
+                    minL * fw, minT * fh, Math.Max(0f, (maxR - minL) * fw), Math.Max(0f, (maxB - minT) * fh));
+                if (rf.Width <= 0f || rf.Height <= 0f) continue;
+                OcrLineInfo li = new OcrLineInfo();
+                li.Text = text;
+                li.Rect = rf;
+                list.Add(li);
+            }
+            return list;
         }
 
         static bool StartsWith(string s, string prefix)

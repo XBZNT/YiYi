@@ -17,6 +17,7 @@
 /r:"C:/Windows/System32/WinMetadata/Windows.ApplicationModel.winmd"
 /r:"C:/Windows/System32/WinMetadata/Windows.Data.winmd"
 /r:"C:/Windows/System32/WinMetadata/Windows.Devices.winmd"
+/r:System.Runtime.WindowsRuntime.dll
 /r:"C:/Windows/System32/WinMetadata/Windows.Foundation.winmd"
 /r:"C:/Windows/System32/WinMetadata/Windows.Gaming.winmd"
 /r:"C:/Windows/System32/WinMetadata/Windows.Globalization.winmd"
